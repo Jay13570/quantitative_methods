@@ -1,0 +1,355 @@
+---
+title: "cart-rf-country-classification.Rmd"
+author: "Jay Yin"
+date: "2026-05-18"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+```
+## Introduction
+This project will adopt the ML method CART on the dataset WVS2021. The main question of this project is "can survey responses about values and attitudes predict which country a respondent is from?" I believe that the three countries of interest, USA, Brazil, and Kenya represent widely different cultural, political, and economical contexts that can be reflected on some of the WVS survey items. The rationale of applying CART is that the outcome variable this project, country of residence, is categorical, the ordinal likert scale property of the dataset can be handled without dummy-coding with CART, and compared to random forest, CART produces a flowchart that is more easily interpretable, which is useful to explore and answer our research question. Random forest method would be more appropriate to the second part of this project, after I have a better understanding of the relationship between the outcomes and the predictors.
+
+## Load Packages
+```{r cars}
+# Load required packages
+library(caret)      # Confusion matrix and accuracy metrics
+library(rpart)      # CART algorithm
+library(rpart.plot) # Tree visualisation
+library(tidyverse)  # Data wrangling and pipes
+library(rsample)    # Train/test split
+library(vip)        # Variable importance plot
+library(readxl)     # Read the Excel file
+library(randomForest)
+```
+
+## Load and process dataset
+```{r}
+# Load the dataset
+dataf <- read_excel("WVS_2021_data.xlsx")
+# Select our variables of interest by name
+# Outcome: country of survey (USA, BRA, KEN)
+# Predictors: curated subset across 7 WVS thematic domains
+
+dataf1 <- dataf %>%
+  select(
+    # Outcome variable
+    B_COUNTRY_ALPHA,
+
+    # Life values (Q1-Q6): importance of family, friends, leisure,
+    # politics, work, and religion in respondent's life
+    Q1, Q2, Q3, Q4, Q5, Q6,
+
+    # Happiness & wellbeing (Q46-Q50): happiness, health,
+    # freedom of choice, life satisfaction, financial satisfaction
+    Q46, Q47, Q48, Q49, Q50,
+
+    # Trust (Q57-Q60): trust in people you know, neighbours,
+    # people you meet for the first time, and people of another religion
+    Q57, Q58, Q59, Q60,
+
+    # Economic values (Q106-Q110): attitudes toward income equality,
+    # private vs state ownership, competition, hard work, and wealth
+    Q106, Q107, Q108, Q109, Q110,
+
+    # Political interest & participation (Q199, Q200):
+    # interest in politics and signing petitions
+    Q199, Q200,
+
+    # Religious values (Q164, Q173): whether respondent
+    # considers themselves religious and importance of God
+    Q164, Q173,
+
+    # Demographics: sex, age, education, social class, income,
+    # employment status, marital status, urban/rural
+    Q260, Q262, Q275, Q287, Q288, Q279, Q273, H_URBRURAL
+  )
+
+# Check dimensions and variable names
+dim(dataf1)
+names(dataf1)
+```
+## Convert Oucome Variable (country of residence)
+```{r}
+#convert outcome variable into a factor for classification
+dataf1$B_COUNTRY_ALPHA <- as.factor(dataf1$B_COUNTRY_ALPHA)
+# Check class balance across the three countries
+table(dataf1$B_COUNTRY_ALPHA)
+prop.table(table(dataf1$B_COUNTRY_ALPHA))
+```
+Class imbalance exists. A naive model that always predicts USA will have an accuracy of 51%. we should keep this in mind when we later evalaute the model.  
+
+## Convert Variables to numeric
+```{r}
+dataf1 <- dataf1 %>%
+  mutate(across(where(is.character), as.numeric))
+```
+We can now start the model training process, we begin with splitting data for training and testing purposes
+## Train/test split
+```{r}
+# Set seed for reproducibility
+set.seed(123)
+# 70% of respondents go to training, 30% to testing
+#stratified sample gurantees the split preserves the country ratios of our data
+split  <- initial_split(dataf1, prop = 0.7, strata = B_COUNTRY_ALPHA)
+trainf <- training(split)
+testf  <- testing(split)
+# Verify the split dimensions
+dim(trainf)
+dim(testf)
+# Check country distribution is preserved in both sets
+prop.table(table(trainf$B_COUNTRY_ALPHA))
+prop.table(table(testf$B_COUNTRY_ALPHA))
+# Fill NA with median
+train_medians <- trainf %>%
+  summarise(across(where(is.numeric), ~ median(.x, na.rm = TRUE)))
+# For training set
+trainf <- trainf %>%
+  mutate(across(where(is.numeric),
+    ~ ifelse(is.na(.x), train_medians[[cur_column()]], .x)))
+# For testing set
+testf <- testf %>%
+  mutate(across(where(is.numeric),
+    ~ ifelse(is.na(.x), train_medians[[cur_column()]], .x)))
+# Verify no missing values remain
+sum(is.na(trainf))
+sum(is.na(testf))
+```
+We may begin modeling our data with CART
+## Baseline CART
+```{r}
+# model 1 — Baseline classification tree with default settings
+model1 <- rpart(B_COUNTRY_ALPHA ~ .,
+                data   = trainf,
+                method = "class")
+# Plot the tree using rpart.plot
+# type = 4 shows the split condition on each branch
+# extra = 104 shows the predicted class and class probabilities at each leaf
+rpart.plot(model1,
+           type  = 4,
+           extra = 104,
+           main  = "Model 1 — Baseline Classification Tree (cp = 0.01)")
+```
+Model 1 is a baseline classification tree built with default settings (cp = 0.01, 10-fold cross-validation). The tree produces 9 splits across 5 levels of depth, resulting in 10 terminal leaf nodes. The root node splits on Q200 (political participation — signing petitions), which is the single most powerful predictor distinguishing the three countries. Respondents who have signed petitions (Q200 < 2) are classified as American with 82% probability, accounting for 46% of the training sample. Among the remaining respondents, Q6 (importance of religion) and Q275 (education level) further separate Brazilian and Kenyan respondents. Q275 appears multiple times across the tree, suggesting that education is a consistently important discriminator across different subgroups. Additional variables that appear in the tree include Q262 (age) and Q108 (attitudes toward competition). Overall, the tree suggests that political participation, education, and religiosity are the sharpest cultural dividers between the United States, Brazil, and Kenya in this dataset. This baseline model will serve as a reference point for evaluating the improvement achieved through cross-validation and pruning in subsequent models.  
+## Verify the model with testing set
+```{r}
+pred1 <- predict(model1, testf, type = "class")
+# Confusion matrix with full accuracy statistics
+confusionMatrix(pred1, testf$B_COUNTRY_ALPHA)
+```
+Model 1 achieves an overall accuracy of 73.2% on the test set, substantially above the no-information rate of 51.1% (p < 0.001), confirming that survey responses about values and attitudes meaningfully predict country of residence. Cohen's Kappa of 0.56 indicates moderate to good agreement beyond chance, accounting for the class imbalance in the dataset. Performance varies considerably across countries: the model identifies American respondents most accurately (sensitivity = 85.2%), followed by Kenyan respondents (68.7%), while Brazilian respondents are most difficult to classify correctly (53.4%). The confusion matrix reveals that the most common misclassification is Kenyan respondents being predicted as Brazilian, suggesting that the value profiles of Kenya and Brazil overlap more than either does with the United States. These results establish a solid baseline that we will attempt to improve through cross-validation and pruning in Models 2 and 3.
+## Model 2, growing larger tree with lower cp
+```{r}
+# cp = 0.001 allows many more splits than the default 0.01
+# This intentionally grows a larger tree that we will later prune
+# xval = 10 runs 10-fold cross-validation to evaluate each split
+model2 <- rpart(B_COUNTRY_ALPHA ~ .,
+                data    = trainf,
+                method  = "class",
+                control = rpart.control(
+                  cp        = 0.001,
+                  minbucket = 15,
+                  xval      = 10))
+printcp(model2)
+# Plot xerror vs cp
+plotcp(model2)
+```
+After reading the cp table, we find that the xerror value (cross-validation error) keeps dropping even at extremely low complexity parameter. This means that the tree keeps finding useful splits even as it grows larger, so it is not useful to find the optimal cp by looking at the absolute minimum xerror. Instead, we will decide the optimal cp through the 1-SE rule.
+## Find optimal cp with 1-SE rule
+```{r}
+#find minimum xerror
+min_xerror <- min(model2$cptable[, "xerror"])
+#calculate the 1-SE threshold
+threshold <- min_xerror + model2$cptable[which.min(model2$cptable[,"xerror"]), "xstd"]
+#find optimal cp
+optimal_cp <- model2$cptable[model2$cptable[,"xerror"] <= threshold, "CP"][1]
+optimal_cp
+```
+This confirms that the optimal cp for our model based on 1-SE rule is around 0.0028. We can now proceed to building a new tree with this value and prune the tree.
+## Prune the full tree for comparison
+```{r}
+pruned_tree <- prune(model2, cp = optimal_cp)
+#Full tree
+rpart.plot(model2,
+           type = 4,
+           extra = 104,
+           fallen.leaves = TRUE,
+           tweak = 1.2,
+           main = "Full Tree (cp = 0.001, 39 splits)")
+# Variable importance plot for the full tree
+vip(model2,
+    num_features = 15,
+    geom         = "col",
+    aesthetics   = list(fill = "coral", color = "white")) +
+  labs(title = "Variable Importance — Full CART Model (cp = 0.001)",
+       x     = "Variables",
+       y     = "Importance") +
+  theme_minimal()
+
+# Pruned tree
+rpart.plot(pruned_tree,
+           type          = 4,
+           extra         = 104,
+           fallen.leaves = TRUE,
+           tweak         = 1.2,
+           main          = "Pruned Tree (cp = 0.00281, 25 splits)")
+# Variable importance plot for the pruned tree
+vip(pruned_tree,
+    num_features = 15,
+    geom = "col",
+    aesthetics = list(fill = "steelblue", color = "white")) +
+  labs(title = "Variable Importance — Pruned CART Model",
+       x = "Variables",
+       y = "Importance") +
+  theme_minimal()
+```
+The variable importance plots of the full tree (39 splits, cp = 0.001) and the pruned tree (25 splits, cp = 0.00281) show that the top eight predictors are identical and in the same order: Q200 (political participation), Q275 (education level), Q6 (importance of religion), Q5 (importance of work), Q199 (political interest), Q262 (age), Q57 (generalised trust), and Q164 (religious self-identification). This suggests that pruning removed noise rather than signal, as the core discriminating variables remain stable regardless of tree complexity. The results indicate that political engagement, education, and religiosity are the most important cultural differences between the United States, Brazil, and Kenya in this dataset. Some minor differences appear in the lower-ranked variables, where a few predictors shift after pruning, suggesting they contributed only marginally to the full tree.  
+## Evaluation of the pruned tree
+```{r}
+# Evaluate the pruned tree on the test set
+pred_pruned <- predict(pruned_tree, testf, type = "class")
+# Confusion matrix for the pruned tree
+confusionMatrix(pred_pruned, testf$B_COUNTRY_ALPHA)
+```
+The pruned CART model (cp = 0.00281, 25 splits) achieves an overall accuracy of 76.6% on the test set, an improvement over the baseline model's 73.2%. Cohen's Kappa improved from 0.56 to 0.62, indicating good agreement beyond chance and confirming that the improvement is not an artefact of class imbalance. Per-class sensitivity improved for all three countries, with the most notable gains for Brazil (53.4% → 59.5%) and Kenya (68.7% → 74.9%), while the United States remained the most accurately classified country (85.9%). The persistent difficulty in classifying Brazilian respondents suggests that Brazil's value profile overlaps with both the United States and Kenya, making it the most culturally ambiguous country in this three-way classification. These results confirm that cross-validation and pruning meaningfully improved model generalisation over the default baseline.  
+
+## Phase 2  
+Phase I demonstrated that CART can predict country of residence from WVS survey responses with reasonable accuracy (76.6%, Kappa = 0.62). However, the results also revealed a consistent weakness: Brazilian respondents were the most difficult to classify correctly, with a sensitivity of only 59.5%. This is likely because Brazil's value profile overlaps with both the United States and Kenya, making it harder for a single decision tree to find clean boundaries. In Phase II, Random Forest is applied to the same dataset and research question. Random Forest builds hundreds of decision trees on random subsets of the data and aggregates their predictions, which reduces the variance that makes a single CART tree sensitive to overlap between classes. The goal is to improve overall classification accuracy and specifically to close the performance gap on Brazilian respondents. The results of both methods will be compared directly at the end of this report.
+
+```{r}
+# MODEL 4 — Baseline Random Forest with default settings
+# ntree = 500: build 500 trees (default)
+# mtry = sqrt(p): number of features per split — default for classification
+# is sqrt(32) ≈ 6 features considered at each split
+# importance = TRUE: needed to extract variable importance later
+set.seed(123)
+model4 <- randomForest(B_COUNTRY_ALPHA ~ .,
+                       data       = trainf,
+                       ntree      = 500,
+                       importance = TRUE)
+
+# Print model summary
+print(model4)
+```
+Model 4 is a baseline Random Forest built with default settings (ntree = 500, mtry = 5). The model achieves an out-of-bag (OOB) error rate of 14.14%, corresponding to an accuracy of approximately 85.9% — a substantial improvement over the pruned CART model's 76.6%. Unlike CART, Random Forest does not require a separate test set for validation at this stage, as the OOB sample provides a built-in estimate of generalisation error: each tree is validated on the roughly 37% of observations not used in its bootstrap sample. Per-class performance also improved considerably across all three countries. Brazil showed the largest gain, with class error dropping from 24.6% (sensitivity = 75.4%) compared to 59.5% in CART — confirming the hypothesis that ensemble averaging helps most where class boundaries are ambiguous. Kenya and the United States also improved, with class errors of 17.1% and 7.6% respectively. These results suggest that the variance reduction achieved by aggregating 500 diverse trees addresses the core limitation of the single CART model.  
+
+Hyperparameter tuning will be applied in the next step to identify the optimal mtry value and further improve performance.
+```{r}
+# Tune mtry using cross-validation
+# tuneRF searches for the optimal number of features per split
+# stepFactor = 1.5: multiply/divide mtry by 1.5 at each step
+# improve = 0.01: stop when OOB improvement drops below 1%
+# ntreeTry = 300: use 300 trees during tuning (faster than 500)
+# trace = TRUE: print progress
+# plot = TRUE: plot OOB error vs mtry
+set.seed(123)
+tuned_mtry <- tuneRF(x      = trainf[, -1],  # all columns except outcome
+                     y      = trainf$B_COUNTRY_ALPHA,
+                     stepFactor = 1.5,
+                     improve    = 0.01,
+                     ntreeTry   = 300,
+                     trace      = TRUE,
+                     plot       = TRUE)
+```
+The function revealed that 3 features per split (mtry = 3) yields the lowest OOB error rate (14.10%), slightly lower than the default (mtry = 5; 14.14%). The tuning does not improve the RF model by much, but we will adopt this new parameter for slight improvement in the tuned model.
+
+```{r}
+# Compare OOB error across different ntree values
+ntree_test <- c(100, 200, 300, 500, 800, 1000)
+
+oob_errors <- sapply(ntree_test, function(n) {
+  set.seed(123)
+  rf_temp <- randomForest(B_COUNTRY_ALPHA ~ .,
+                          data  = trainf,
+                          ntree = n,
+                          mtry  = 3)
+  return(rf_temp$err.rate[n, "OOB"])
+})
+
+# Print results
+data.frame(ntree = ntree_test, OOB_error = round(oob_errors, 4))
+```
+OOB error continued to decline marginally with increasing ntree but showed diminishing returns beyond 500 trees, suggesting the model approaches its accuracy ceiling with the current feature set.
+
+```{r}
+# mtry = 3: optimal features per split found by tuneRF
+# ntree = 500: 500 trees for stable predictions
+# importance = TRUE: needed for variable importance plot
+set.seed(123)
+model5 <- randomForest(B_COUNTRY_ALPHA ~ .,
+                       data       = trainf,
+                       ntree      = 500,
+                       mtry       = 3,
+                       importance = TRUE)
+
+# Print model summary
+print(model5)
+```
+
+```{r}
+# Evaluate Model 5 on the test set
+# This gives us comparable numbers to the CART test set evaluation
+pred_rf <- predict(model5, testf, type = "class")
+
+# Confusion matrix
+confusionMatrix(pred_rf, testf$B_COUNTRY_ALPHA)
+```
+The tuned Random Forest model (ntree = 500, mtry = 3) achieves an overall accuracy of 85.2% on the held-out test set (n = 1,480), with a 95% confidence interval of 83.3% to 87.0%. This is substantially above the no-information rate of 51.1% (p < 0.001), and represents an 8.6 percentage point improvement over the pruned CART model. Cohen's Kappa of 0.758 indicates substantial agreement beyond chance — a meaningful improvement over CART's Kappa of 0.621. Per-class sensitivity improved for all three countries compared to CART: the United States remained the most accurately classified country (92.9%), followed by Kenya (80.9%) and Brazil (73.7%). Brazil showed the largest absolute gain of 14.2 percentage points over the pruned CART model, confirming the hypothesis that ensemble averaging specifically benefits classification where class boundaries are ambiguous. The confusion matrix reveals that the most common remaining misclassification is Brazilian respondents being predicted as American (n = 60), and Kenyan respondents being predicted as Brazilian (n = 33) — both reduced substantially from CART. Despite these improvements, Brazil remains the most difficult country to classify, suggesting that the value overlap between Brazil and the other two countries reflects genuine cultural ambiguity that cannot be fully resolved through model tuning alone.  
+
+## Statistical Comparison Between CART and RF
+```{r}
+# Summary comparison table — CART vs Random Forest
+comparison <- data.frame(
+  Model = c("Baseline CART", "Pruned CART", "Tuned RF"),
+  Accuracy = c(0.7324, 0.7662, 0.8520),
+  Kappa = c(0.5624, 0.6212, 0.7583),
+  BRA_Sensitivity = c(0.5335, 0.5952, 0.7373),
+  KEN_Sensitivity = c(0.6866, 0.7493, 0.8091),
+  USA_Sensitivity = c(0.8519, 0.8585, 0.9286)
+)
+
+print(comparison)
+```
+
+```{r}
+# Per-class sensitivity comparison across all three models
+sensitivity_long <- comparison %>%
+  select(Model, BRA_Sensitivity, KEN_Sensitivity, USA_Sensitivity) %>%
+  pivot_longer(cols      = c(BRA_Sensitivity, KEN_Sensitivity, USA_Sensitivity),
+               names_to  = "Country",
+               values_to = "Sensitivity") %>%
+  mutate(Country = recode(Country,
+                          "BRA_Sensitivity" = "Brazil",
+                          "KEN_Sensitivity" = "Kenya",
+                          "USA_Sensitivity" = "USA"),
+         Model = factor(Model,
+                        levels = c("Baseline CART",
+                                   "Pruned CART",
+                                   "Tuned RF")))
+
+ggplot(sensitivity_long,
+       aes(x = Country, y = Sensitivity, fill = Model)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Baseline CART" = "#D3D3D3",
+                                "Pruned CART"   = "steelblue",
+                                "Tuned RF"      = "coral")) +
+  geom_text(aes(label = scales::percent(Sensitivity, accuracy = 0.1)),
+            position = position_dodge(width = 0.9),
+            vjust    = -0.5,
+            size     = 3) +
+  labs(title = "Per-Class Sensitivity — CART vs Random Forest",
+       x     = "Country",
+       y     = "Sensitivity",
+       fill  = "Model") +
+  theme_minimal() +
+  coord_cartesian(ylim = c(0, 1.05))
+```
+The bar chart compares per-class sensitivity across the three models for each country. A consistent pattern of improvement is visible across all three countries from baseline CART to pruned CART to tuned Random Forest. Brazil shows the most dramatic progression (53.4% → 59.5% → 73.7%), reflecting the cumulative benefit of both pruning and ensemble averaging for the most ambiguous classification boundary. Kenya follows a similar pattern (68.7% → 74.9% → 80.9%), while the United States shows the smallest relative gain (85.2% → 85.8% → 92.9%), likely because American respondents were already well-separated from the other two countries by a small number of strong predictors such as Q200 and Q275. The graph illustrates that Random Forest's improvement over CART is not uniform — it is largest where classification is hardest, which is consistent with the theoretical expectation that ensemble variance reduction benefits ambiguous class boundaries more than clear ones.  
+
+## Conclusion
+
+This project applied two machine learning methods — CART and Random Forest — to the World Values Survey 2021 dataset to answer the question: can survey responses about values and attitudes predict which country a respondent is from? Across both phases, the results consistently confirmed that this is possible, with meaningful and improving accuracy across all models. The baseline CART model achieved 73.2% accuracy (Kappa = 0.56), which improved to 76.6% (Kappa = 0.62) after cross-validation and pruning. The tuned Random Forest model further improved performance to 85.2% accuracy (Kappa = 0.758), representing a substantial gain over the best CART model. Variable importance results from both methods consistently identified Q200 (political participation), Q275 (education level), and Q6 (importance of religion) as the strongest predictors, suggesting that political engagement, educational attainment, and religiosity are the most meaningful cultural differences between the United States, Brazil, and Kenya in this dataset. Brazil remained the most difficult country to classify across all models, with the lowest sensitivity in every configuration. This persistent difficulty is attributed to genuine value overlap between Brazil and the other two countries rather than insufficient data or model limitations, as increasing model complexity and ensemble size yielded only marginal further improvement in Brazil's classification. These findings demonstrate that Random Forest substantially outperforms a single decision tree for cross-cultural classification tasks, particularly where class boundaries are ambiguous. Future work could explore feature engineering — for example constructing composite scores from theoretically related variables — or apply the analysis to the full WVS dataset across more countries to test whether the identified cultural dimensions generalise beyond this three-country comparison.
